@@ -1,6 +1,6 @@
 {
   "providers": {
-    "responses-websocket": {
+    "OpenAI-ws": {
       "baseUrl": "https://YOUR_GATEWAY/v1",
       "api": "openai-responses",
       "apiKey": "$RESPONSES_WS_API_KEY",

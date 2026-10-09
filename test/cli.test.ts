@@ -29,8 +29,15 @@ function run(args: string[], cwd: string, agentDir: string): Promise<{ code: num
   });
 }
 
-for (const withInstructions of instructionsExtension ? [false, true] : [false])
-for (const fallback of [false, true]) test(`actual Pi loader + models.json ${fallback ? "falls back to SSE" : "sends a WS request"}${withInstructions ? " + instructions extension" : ""}`, { timeout: 60000 }, async t => {
+const scenarios = [
+  ...["responses-websocket", "OpenAI-ws", "OpenAI-WS", "GPT-WS", "custom-Ws", "OpenAI_ws", "OpenAI_WS", "GPT_WS", "custom_Ws"].flatMap(provider =>
+    [false, true].map(fallback => ({ provider, fallback, websocket: true, withInstructions: false }))),
+  ...["OpenAI", "OpenAI-ws-extra", "OpenAI_ws_extra"].map(provider => ({ provider, fallback: false, websocket: false, withInstructions: false })),
+  ...(instructionsExtension ? [false, true].map(fallback => ({ provider: "responses-websocket", fallback, websocket: true, withInstructions: true })) : []),
+];
+for (const { provider, fallback, websocket, withInstructions } of scenarios)
+test(`actual Pi loader + models.json: ${provider} ${fallback ? "falls back to SSE" : websocket ? "sends a WS request" : "keeps HTTP"}${withInstructions ? " + instructions extension" : ""}`, { timeout: 60000 }, async t => {
+  const useHttp = fallback || !websocket;
   const instructionBodies: Record<string, unknown>[] = [];
   const checkInstructions = (body: Record<string, unknown>) => {
     if (withInstructions) instructionBodies.push(body);
@@ -42,7 +49,7 @@ for (const fallback of [false, true]) test(`actual Pi loader + models.json ${fal
   await mkdir(work);
   let posts = 0;
   const http = createServer(async (req, res) => {
-    if (fallback && req.method === "POST") {
+    if (useHttp && req.method === "POST") {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const body = JSON.parse(Buffer.concat(chunks).toString());
@@ -50,6 +57,7 @@ for (const fallback of [false, true]) test(`actual Pi loader + models.json ${fal
       assert.equal(body.stream, true);
       assert.equal(body.type, undefined);
       assert.equal(req.headers.authorization, "Bearer mock-key");
+      assert.equal(req.headers["x-test-provider"], provider);
       posts++;
       const item = { type: "message", id: "msg_http", role: "assistant", status: "completed", content: [{ type: "output_text", text: "HTTP_CLI_OK", annotations: [] }] };
       res.writeHead(200, { "content-type": "text/event-stream" });
@@ -63,10 +71,15 @@ for (const fallback of [false, true]) test(`actual Pi loader + models.json ${fal
     res.writeHead(400, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: { message: `Expected WebSocket, received HTTP ${req.method} ${req.url}` } }));
   });
-  const wss = new WebSocketServer({ server: http, verifyClient: (_info, done) => done(!fallback, 426, "Upgrade unavailable") });
+  let upgrades = 0;
+  const wss = new WebSocketServer({ server: http, verifyClient: (_info, done) => {
+    upgrades++;
+    done(!fallback, 426, "Upgrade unavailable");
+  } });
   let requests = 0;
   wss.on("connection", (socket, req) => {
     assert.equal(req.headers.authorization, "Bearer mock-key");
+    assert.equal(req.headers["x-test-provider"], provider);
     assert.equal(req.url, "/v1/responses");
     socket.on("message", raw => {
       const body = JSON.parse(raw.toString());
@@ -91,8 +104,10 @@ for (const fallback of [false, true]) test(`actual Pi loader + models.json ${fal
     await rm(dir, { recursive: true, force: true });
   });
   await writeFile(join(agentDir, "models.json"), JSON.stringify({ providers: {
-    "responses-websocket": {
+    [provider]: {
+      name: "My configured provider",
       api: "openai-responses", apiKey: "mock-key",
+      headers: { "x-test-provider": provider },
       baseUrl: `http://127.0.0.1:${(http.address() as AddressInfo).port}/v1`,
       models: [{ id: "mock-model", name: "Mock WS", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 2048, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
     },
@@ -102,13 +117,14 @@ for (const fallback of [false, true]) test(`actual Pi loader + models.json ${fal
   if (withInstructions) flags.push("-e", instructionsExtension!, "--system-prompt", instructionsMarker);
   const catalog = await run([...flags, "--list-models", "mock-model"], work, agentDir);
   assert.equal(catalog.code, 0, catalog.err + catalog.out);
-  assert.match(catalog.out, /responses-websocket/);
+  assert.ok(catalog.out.includes(provider), catalog.out);
   assert.doesNotMatch(catalog.err + catalog.out, /Failed to load extension|Extension Error/i);
-  const generation = await run([...flags, "--model", "responses-websocket/mock-model", "--no-tools", "--no-session", "--print", "hello"], work, agentDir);
+  const generation = await run([...flags, "--model", `${provider}/mock-model`, "--no-tools", "--no-session", "--print", "hello"], work, agentDir);
   assert.equal(generation.code, 0, generation.err + generation.out);
-  assert.match(generation.out, fallback ? /HTTP_CLI_OK/ : /WS_CLI_OK/);
-  assert.equal(requests, fallback ? 0 : 1);
-  assert.equal(posts, fallback ? 1 : 0);
+  assert.match(generation.out, useHttp ? /HTTP_CLI_OK/ : /WS_CLI_OK/);
+  assert.equal(upgrades, websocket ? 1 : 0);
+  assert.equal(requests, useHttp ? 0 : 1);
+  assert.equal(posts, useHttp ? 1 : 0);
   if (withInstructions) {
     assert.equal(instructionBodies.length, 1);
     const body = instructionBodies[0];
