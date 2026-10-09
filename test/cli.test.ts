@@ -122,9 +122,17 @@ test(`actual Pi loader + models.json: ${provider} ${fallback ? "falls back to SS
   const generation = await run([...flags, "--model", `${provider}/mock-model`, "--no-tools", "--no-session", "--print", "hello"], work, agentDir);
   assert.equal(generation.code, 0, generation.err + generation.out);
   assert.match(generation.out, useHttp ? /HTTP_CLI_OK/ : /WS_CLI_OK/);
-  assert.equal(upgrades, websocket ? 1 : 0);
+  assert.equal(upgrades, websocket ? fallback ? 4 : 1 : 0);
   assert.equal(requests, useHttp ? 0 : 1);
   assert.equal(posts, useHttp ? 1 : 0);
+  if (provider === "GPT_WS" && fallback) {
+    upgrades = 0;
+    posts = 0;
+    const twoTurns = await run([...flags, "--model", `${provider}/mock-model`, "--no-tools", "--no-session", "--print", "hello", "again"], work, agentDir);
+    assert.equal(twoTurns.code, 0, twoTurns.err + twoTurns.out);
+    assert.equal(upgrades, 8, "each user message must start a fresh four-attempt WS cycle");
+    assert.equal(posts, 2);
+  }
   if (withInstructions) {
     assert.equal(instructionBodies.length, 1);
     const body = instructionBodies[0];

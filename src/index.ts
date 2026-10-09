@@ -30,6 +30,13 @@ export default function responsesWebSocketExtension(pi: ExtensionAPI): void {
   });
   // /model can reload models.json and introduce providers after session_start.
   pi.on("model_select", event => register(event.model.provider));
+  // Reset when a user message actually enters the agent loop, not when input
+  // is merely queued. Tool results, automatic retries and compaction do not
+  // start a new user turn; steering/follow-up user messages do.
+  pi.on("message_start", (event, ctx) => {
+    if (event.message.role !== "user") return;
+    for (const pool of pools.values()) pool.beginUserTurn(ctx.sessionManager.getSessionId());
+  });
   pi.on("session_shutdown", () => {
     for (const pool of pools.values()) pool.close();
   });

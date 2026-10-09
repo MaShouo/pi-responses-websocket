@@ -21,7 +21,10 @@ function fixture() {
   const emit = (event: string, payload: unknown = {}, providers: string[] = []) => {
     const handler = handlers.get(event);
     assert.ok(handler, `Missing ${event} handler`);
-    return handler(payload, { modelRegistry: { getAll: () => providers.map(provider => ({ provider })) } });
+    return handler(payload, {
+      modelRegistry: { getAll: () => providers.map(provider => ({ provider })) },
+      sessionManager: { getSessionId: () => "session-1" },
+    });
   };
   return { registrations, emit, calls: () => calls };
 }
@@ -68,4 +71,43 @@ test("shutdown closes every provider pool", t => {
   f.emit("session_start", {}, ["OpenAI-ws", "GPT-WS"]);
   f.emit("session_shutdown");
   assert.equal(closed.size, 3);
+});
+
+test("only actual user messages reset the transport for every registered provider", t => {
+  const resets: string[] = [];
+  t.mock.method(ResponsesSocketPool.prototype, "beginUserTurn", (sessionId: string) => {
+    resets.push(sessionId);
+    return { useSse: false };
+  });
+  const f = fixture();
+  f.emit("session_start", {}, ["OpenAI-ws", "GPT_WS"]);
+  f.emit("message_start", { message: { role: "user" } });
+  assert.deepEqual(resets, ["session-1", "session-1", "session-1"]);
+  f.emit("message_start", { message: { role: "assistant" } });
+  f.emit("message_start", { message: { role: "toolResult" } });
+  assert.equal(resets.length, 3);
+  f.emit("message_start", { message: { role: "user" } });
+  assert.equal(resets.length, 6);
+});
+
+test("user turn transport is session-isolated and old requests cannot overwrite a new turn", () => {
+  const pool = new ResponsesSocketPool();
+  const old = pool.getUserTurn("a");
+  old.useSse = true;
+  assert.equal(pool.getUserTurn("a").useSse, true);
+  assert.equal(pool.getUserTurn("b").useSse, false);
+  const next = pool.beginUserTurn("a");
+  old.useSse = true;
+  assert.equal(next.useSse, false);
+  assert.equal(pool.getUserTurn("a"), next);
+  next.useSse = true;
+  pool.close();
+  assert.equal(pool.getUserTurn("a").useSse, false);
+});
+
+test("anonymous SDK calls do not share user-turn fallback state", () => {
+  const pool = new ResponsesSocketPool();
+  pool.getUserTurn().useSse = true;
+  assert.equal(pool.getUserTurn().useSse, false);
+  pool.close();
 });

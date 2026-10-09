@@ -5,6 +5,7 @@ import WebSocket from "ws";
 export type JsonObject = Record<string, unknown>;
 export interface ResponseBody extends JsonObject { input: unknown[] }
 export interface WireEvent extends JsonObject { type: string }
+export interface UserTurnTransport { useSse: boolean }
 
 export class WebSocketTransportError extends Error {
   constructor(message: string, readonly fallbackAllowed = true, options?: ErrorOptions) {
@@ -86,6 +87,21 @@ export class ResponsesSocketPool {
   private entries = new Map<string, Entry>();
   private all = new Set<Entry>();
   private requests = new Set<AbortController>();
+  private userTurns = new Map<string, UserTurnTransport>();
+
+  // A new object prevents an older in-flight request from changing a newer turn.
+  // Keep this independent of socket lifetime: idle recycling and failed dials
+  // must not reset SSE affinity while tools are still executing.
+  beginUserTurn(sessionId?: string): UserTurnTransport {
+    const turn = { useSse: false };
+    if (sessionId) this.userTurns.set(sessionId, turn);
+    return turn;
+  }
+
+  getUserTurn(sessionId?: string): UserTurnTransport {
+    // Calls without a session identity must not share a global fallback flag.
+    return (sessionId ? this.userTurns.get(sessionId) : undefined) ?? this.beginUserTurn(sessionId);
+  }
 
   beginRequest(signal?: AbortSignal): { signal: AbortSignal; dispose: () => void } {
     const controller = new AbortController();
@@ -99,6 +115,7 @@ export class ResponsesSocketPool {
   close(): void {
     for (const controller of this.requests) controller.abort();
     this.requests.clear();
+    this.userTurns.clear();
     for (const entry of this.all) this.discard(entry);
   }
 

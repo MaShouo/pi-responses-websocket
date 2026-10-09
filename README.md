@@ -138,23 +138,33 @@ npm test
 
 | `transport` | 行为 |
 |---|---|
-| `auto` | 优先 WS 和增量续接，满足以下条件时单次回退 HTTP(S)/SSE |
+| `auto` | 每条用户消息优先 WS，可恢复失败后重试 3 次（共最多 4 次），全部失败回退 SSE 并保持本用户轮次 |
 | `websocket` | 强制 WS，复用连接但发送完整输入，不回退 SSE |
 | `websocket-cached` | 强制 WS，可增量续接，不回退 SSE |
 | `sse` | 直接使用 HTTP(S)/SSE，不尝试 WS |
 
-回退规则：
+默认 `auto` 的重试及轮次规则：
 
-- 握手返回 `404` / `405` / `426` / `5xx`，或建立连接失败时，可以回退。
+- 初次 WS 尝试失败后，依次等待 **250 / 500 / 1000 毫秒**重试，最多尝试 4 次；任何一次成功即停止重试。每次失败丢弃该连接，重试使用完整历史，不带插件生成的旧响应引用。
+- 全部尝试失败后，本次调用发送一次 HTTP(S)/SSE 请求。此后同一条用户消息触发的工具续轮和后续生成直接使用 SSE，不再探测 WS；即使 SSE 自身失败，该用户轮次也继续保持 SSE。
+- 下一条用户消息**实际进入 agent loop** 时重置为 WS 优先；排队但尚未处理的输入不提前重置。重复相同文本、steering 和 follow-up 用户消息同样重置。工具结果和 Pi 自动重试不重置。
+- 轮次状态按 provider 的连接池和 `sessionId` 隔离，独立于连接回收。正常 WS 成功时仍可复用已有健康连接，不强制每条用户消息重新握手。使用独立 `sessionId` 的摘要等辅助请求独立选择传输。
+- 新策略仅应用于 `auto`。`websocket` / `websocket-cached` 仍只有一次 WS 尝试且不回退；`sse` 始终直接使用 HTTP。
+- SDK 显式提供 `maxRetries` 时可降低重试次数，上限仍是 3；`maxRetries: 0` 的 best-effort 调用（例如 Pi 缓存预热）只尝试一次 WS，可沿用已有 SSE 状态，但自身失败不会更改用户轮次状态。无 `sessionId` 的独立调用不共享回退状态；直接使用 provider API 的调用方需在每条新用户消息前调用 `pool.beginUserTurn(sessionId)`，Pi 扩展会自动处理。
+
+允许重试及回退的错误：
+
+- 握手返回 `404` / `405` / `426` / `5xx`，或建立连接失败时，可以重试，耗尽后回退。
 - WS 开始返回内容前的传输故障或响应等待超时，可以回退。已收到文本、推理、工具调用或其他输出事件后，**不自动重发**，包括尚在队列中未展示的输出。
 - 明确返回 `websocket_not_supported` / `unsupported_websocket_protocol` 可以回退。
-- 扩展生成的增量续接收到 `previous_response_not_found` / `previous_response_id_not_found` 时，使用保存的完整历史、不带旧引用回退 SSE。调用方自带 `previous_response_id` 时不猜测完整历史，不自动回退。
+- `websocket_connection_limit_reached` 按 Codex 的做法视为可恢复的连接到期错误，即使 WS 错误事件附带 `status: 400`：关闭旧连接，新建 WS 并用完整历史重试，不携带旧增量引用；恢复后可继续增量续接。重试耗尽才回退 SSE。该处理仍受“已收到输出不重发”、取消及强制传输模式限制，不改变普通 HTTP 400 的处理。
+- 扩展生成的增量续接收到 `previous_response_not_found` / `previous_response_id_not_found` 时，使用保存的完整历史、不带旧引用重试 WS，耗尽后回退 SSE。调用方自带 `previous_response_id` 时不猜测完整历史，不自动重试或回退。
 - 鉴权、配额、参数、上下文长度错误，以及取消、插件关闭、hook 异常、畸形 JSON 等不会因更换传输自动重试。握手的其他 `4xx` 和重定向不回退。
-- 同一次调用最多发送一次 SSE 请求；SSE 失败直接报告，不循环重试。下一次调用仍按 `transport` 选择（不永久记住回退）。Pi 自身的代理级重试由 Pi 设置管理。
+- 同一次调用最多发送一次 SSE 请求；SSE 失败直接报告，不在插件内部循环重试。Pi 自身的代理级重试由 Pi 设置管理，同一用户轮次的代理重试仍遵循已经选定的 SSE。
 - `wss/https` 回退到 **HTTPS**，本地 `ws/http` 回退到 **HTTP**；保留路径前缀、query、鉴权与完整请求。不跟随 HTTP 重定向。
-- 回退记录在 assistant 消息的 `diagnostics` 中，类型为 `responses_ws_fallback`。
+- 切换到 SSE 时记录在 assistant 消息的 `diagnostics` 中，类型为 `responses_ws_fallback`，包含本次 WS 尝试次数 `attempts`。本轮之后直接使用 SSE 的调用不会重复记录切换事件。
 
-收到输出前失败也不能证明上游没有开始计算；回退可能产生额外用量，但不会重放已经接收的工具调用。
+收到输出前失败也不能证明上游没有开始计算；WS 重试及 SSE 回退可能产生额外用量，但不会重放已经接收的工具调用。
 
 其他行为：
 
@@ -163,8 +173,8 @@ npm test
 - provider、Key、headers、URL 或 session 改变时不共享连接；每个匹配的 provider 使用独立连接池，并发调用使用不同连接。
 - 分支切换、历史修改、提示词或工具改变时，匹配失败就发送完整输入，不猜测历史。
 - 取消、异常、输出截断会丢弃连接；下次 WS 调用重新连接并使用完整输入。
-- 连接和响应空闲超时读取 Pi 的 `websocketConnectTimeoutMs` / `timeoutMs` 请求选项，默认 15 秒 / 5 分钟；空闲 WS 连接 5 分钟后释放。SSE 的请求等待/事件等待也使用 `timeoutMs`。
-- `onPayload` 每次逻辑调用只执行一次；回退沿用其完整结果，不重复执行变换。`onResponse` 在新 WS 握手成功时报告 101，HTTP 时报告实际状态；`onProviderStreamEvent` 收到原始事件。
+- 连接和响应空闲超时读取 Pi 的 `websocketConnectTimeoutMs` / `timeoutMs` 请求选项，默认 15 秒 / 5 分钟；各次尝试独立计时，4 次握手全部超时约需 60 秒加 1.75 秒退避时间。空闲 WS 连接 5 分钟后释放。SSE 的请求等待/事件等待也使用 `timeoutMs`。
+- `onPayload` 每次逻辑调用只执行一次；WS 重试和 SSE 回退沿用其完整结果，不重复执行变换。`onResponse` 在每次新 WS 握手成功时报告 101，HTTP 时报告实际状态；`onProviderStreamEvent` 按尝试收到原始事件，因此一次逻辑调用可能报告多次握手及失败尝试的元数据事件。
 - WS 使用 Node `ws` 直接连接，不使用 `fetch`；HTTP 使用 `options.fetch` 或全局 `fetch`。扩展不额外配置 `HTTP_PROXY` / `HTTPS_PROXY`，实际 HTTP 代理行为由宿主 fetch 决定。
 
 支持标准 Responses 协议并不等于实现某个网关特有的会话恢复、路由 nonce 或 Codex 全套功能。本版不处理这些专用协议，也不提供后台生成、预热、原生压缩、搜索或生图工具。
@@ -180,7 +190,7 @@ npm pack --dry-run
 
 测试仅使用 loopback WebSocket 服务、临时 Pi 配置和合成 Key，不读取用户凭据，不向生产模型发送请求。覆盖文本/Unicode、推理、用量、工具增量与全量重放、图片输入与工具图片结果、跨 provider 历史、连接隔离、hooks、取消、超时、握手拒绝和未完成工具调用。
 
-本机验证：`npm run check` 通过，`npm test` **89/89 通过**。包括大小写不敏感的 `*-ws` / `*_ws` 识别、运行中模型切换注册、连接池关闭，以及实际 Pi CLI 对 `OpenAI-ws` / `OpenAI-WS` / `GPT-WS` / `custom-Ws` 及下划线版本的 WS 请求和 SSE 回退。普通 `OpenAI` 和 `OpenAI-ws-extra` 仍使用原有 HTTP 路径；旧名称 `responses-websocket` 保持兼容。本轮未设置可选的 `PI_RESPONSES_WS_TEST_INSTRUCTIONS`，未运行实际 companion 扩展兼容测试。
+本机验证：`npm run check` 通过，`npm test` **116/116 通过**。新增连接到期错误的三种事件封装、换连接全量恢复后重新增量续接、重试耗尽回退，以及输出后禁止重放等测试。覆盖 WS 最多 4 次尝试、重试成功、工具续轮保持 SSE、新用户轮次重置、取消退避、调用方重试上限，以及实际 Pi CLI 在同一进程处理两条用户消息时分别重新尝试 WS。另包括大小写不敏感的 `*-ws` / `*_ws` 识别、运行中模型切换注册、连接池关闭，以及实际 Pi CLI 对 `OpenAI-ws` / `OpenAI-WS` / `GPT-WS` / `custom-Ws` 及下划线版本的 WS 请求和 SSE 回退。普通 `OpenAI` 和 `OpenAI-ws-extra` 仍使用原有 HTTP 路径；旧名称 `responses-websocket` 保持兼容。本轮未设置可选的 `PI_RESPONSES_WS_TEST_INSTRUCTIONS`，未运行实际 companion 扩展兼容测试。
 
 `PI_RESPONSES_WS_TEST_CLI` 可指定另一个 Pi `dist/cli.js` 路径，验证实际宿主加载。未进行真实 Sub2API/AIO/官方 API 联调；部署端是否启用 WebSocket、模型/配额是否可用仍由部署配置决定。
 

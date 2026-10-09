@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import {
   clampThinkingLevel, createAssistantMessageEventStream,
   getDeclaredTools, normalizeContext, resolveTranscript, resolveTranscriptTools,
@@ -100,7 +101,14 @@ async function* parsedEvents(events: AsyncIterable<WireEvent>, model: ResponsesM
     await options.onProviderStreamEvent?.(raw, model);
     if (raw.type === "error" || raw.type === "response.failed") {
       const response = raw.response as { error?: { code?: string } } | undefined;
-      const error = (raw.error ?? response?.error ?? raw) as { code?: string };
+      const error = (raw.error ?? response?.error ?? raw) as { code?: string; message?: string };
+      // Like Codex, treat the 60-minute socket lifetime limit as retryable
+      // even when the error envelope carries status 400. The retry loop drops
+      // the old lease and sends full input on a new connection. SSE errors
+      // retain their original classification (recoverContinuation is false).
+      if (recoverContinuation && error.code === "websocket_connection_limit_reached") {
+        throw new WebSocketTransportError(`${error.code}: ${error.message ?? "Responses WebSocket connection expired; reconnect to continue"}`);
+      }
       if (recoverContinuation && ["previous_response_not_found", "previous_response_id_not_found"].includes(error.code ?? "")) {
         throw new ContinuationRejected("WebSocket previous_response_id was not found");
       }
@@ -123,6 +131,10 @@ export function createResponsesWebSocketApi(pool = new ResponsesSocketPool()): P
     const events = createAssistantMessageEventStream();
     const request = pool.beginRequest(options.signal);
     options = { ...options, signal: request.signal };
+    // Best-effort callers (e.g. cache warming) may explicitly disable retries.
+    // They can follow existing SSE affinity, but must not change the user turn.
+    const sharedTurn = pool.getUserTurn(options.sessionId);
+    const userTurn = options.maxRetries === 0 ? { ...sharedTurn } : sharedTurn;
     const output: AssistantMessage = {
       role: "assistant", api: rawModel.api, provider: rawModel.provider, model: rawModel.id,
       timestamp: Date.now(), content: [], stopReason: "pending",
@@ -149,37 +161,57 @@ export function createResponsesWebSocketApi(pool = new ResponsesSocketPool()): P
             grammarToolInputProperties: conversion.grammarToolInputProperties,
           });
         };
-        if (transport === "sse") {
+        if (transport === "sse" || transport === "auto" && userTurn.useSse) {
           await http();
         } else {
-          try {
-            lease = await pool.acquire({
-              url: responsesUrl(model.baseUrl), headers,
-              sessionId: options.cacheRetention === "none" ? undefined : options.sessionId,
-              signal: options.signal, connectTimeoutMs: options.websocketConnectTimeoutMs, idleTimeoutMs: options.timeoutMs,
-              onHandshake: async response => { await options.onResponse?.(response, model); },
-            });
-            start();
-            const cached = transport !== "websocket" && options.cacheRetention !== "none";
-            await processResponsesStream(parsedEvents(lease.events(body, cached), model, options, true), output, events, model, {
-              grammarToolInputProperties: conversion.grammarToolInputProperties,
-            });
-          } catch (error) {
-            const recoverable = error instanceof WebSocketTransportError && error.fallbackAllowed ||
-              error instanceof WebSocketUnsupported || error instanceof ContinuationRejected && lease?.usedContinuation;
-            if (transport !== "auto" || options.signal?.aborted || lease?.receivedOutput || output.content.length ||
-                body.previous_response_id || !recoverable) throw error;
-            lease?.release();
-            lease = undefined;
-            // The saved body is full history, never the WS-only delta. Hooks
-            // ran once; replaying them would compound payload transformations.
-            delete output.responseId;
-            delete output.rawStopReason;
-            delete output.errorMessage;
-            output.stopReason = "pending";
-            output.diagnostics = [{ type: "responses_ws_fallback", timestamp: Date.now(),
-              details: { from: "websocket", to: "sse", reason: error instanceof ContinuationRejected ? "continuation_not_found" : "transport_unavailable" } }];
-            await http();
+          const retries = Number.isFinite(options.maxRetries)
+            ? Math.max(0, Math.min(3, Math.trunc(options.maxRetries!))) : 3;
+          const maxAttempts = transport === "auto" ? retries + 1 : 1;
+          let continuationRejected = false;
+          for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            try {
+              lease = await pool.acquire({
+                url: responsesUrl(model.baseUrl), headers,
+                sessionId: options.cacheRetention === "none" ? undefined : options.sessionId,
+                signal: options.signal, connectTimeoutMs: options.websocketConnectTimeoutMs, idleTimeoutMs: options.timeoutMs,
+                onHandshake: async response => { await options.onResponse?.(response, model); },
+              });
+              start();
+              // Retries always replay the saved full body, never a stale delta.
+              const cached = attempt === 0 && transport !== "websocket" && options.cacheRetention !== "none";
+              await processResponsesStream(parsedEvents(lease.events(body, cached), model, options, true), output, events, model, {
+                grammarToolInputProperties: conversion.grammarToolInputProperties,
+              });
+              break;
+            } catch (error) {
+              const recoverable = error instanceof WebSocketTransportError && error.fallbackAllowed ||
+                error instanceof WebSocketUnsupported ||
+                error instanceof ContinuationRejected && (lease?.usedContinuation || continuationRejected);
+              if (transport !== "auto" || options.signal?.aborted || lease?.receivedOutput || output.content.length ||
+                  body.previous_response_id || !recoverable) throw error;
+              continuationRejected ||= error instanceof ContinuationRejected;
+              lease?.release();
+              lease = undefined;
+              // onPayload ran once per logical request; response/event hooks
+              // still report each attempt. Clear failed-attempt metadata without
+              // emitting a second start or replaying any output.
+              delete output.responseId;
+              delete output.rawStopReason;
+              delete output.errorMessage;
+              output.stopReason = "pending";
+              if (attempt + 1 < maxAttempts && !userTurn.useSse) {
+                await delay(250 * 2 ** attempt, undefined, { signal: options.signal });
+                // Another request in this user turn may have selected SSE while
+                // this request was waiting. Do not restart WS in that case.
+                if (!userTurn.useSse) continue;
+              }
+              userTurn.useSse = true;
+              output.diagnostics = [{ type: "responses_ws_fallback", timestamp: Date.now(),
+                details: { from: "websocket", to: "sse", attempts: attempt + 1,
+                  reason: continuationRejected ? "continuation_not_found" : "transport_unavailable" } }];
+              await http();
+              break;
+            }
           }
         }
         if (options.signal?.aborted) throw new Error("Request was aborted");
