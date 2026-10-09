@@ -1,0 +1,20 @@
+{
+  "providers": {
+    "responses-websocket": {
+      "baseUrl": "https://YOUR_GATEWAY/v1",
+      "api": "openai-responses",
+      "apiKey": "$RESPONSES_WS_API_KEY",
+      "models": [
+        {
+          "id": "YOUR_MODEL_ID",
+          "name": "My model (WebSocket)",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 128000,
+          "maxTokens": 16384,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "name": "pi-responses-websocket",
+  "version": "0.2.0",
+  "description": "Generic API-key OpenAI Responses WebSocket provider for Pi",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package",
+    "openai",
+    "responses",
+    "websocket"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "models.example.json",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=1.1.0 <1.2.0",
+    "@earendil-works/pi-coding-agent": ">=1.1.0 <1.2.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@types/node": "^22.19.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3"
+  }
+}
